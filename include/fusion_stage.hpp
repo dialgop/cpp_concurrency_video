@@ -9,6 +9,9 @@
 #include <thread>
 #include <vector>
 
+// A frame captured by one of several sources (e.g. camera / key / fill in a
+// broadcast keyer), timestamped so a FusionStage can tell how far apart two
+// sources' contributions to a fused frame really were.
 struct Frame {
     std::size_t source_id;
     std::uint64_t seq;
@@ -16,15 +19,32 @@ struct Frame {
     double value; // stand-in payload, e.g. average pixel luma
 };
 
-
+// The result of combining one frame from every still-active source.
 struct FusedFrame {
     std::chrono::steady_clock::time_point fused_at;
-    std::vector<double> source_values;
-    std::vector<bool> source_active;
-    std::chrono::steady_clock::duration spread;
-    double composite;
+    std::vector<double> source_values;         // indexed by source_id, only for active sources
+    std::vector<bool> source_active;            // which indices were actually contributed this phase
+    std::chrono::steady_clock::duration spread; // max - min captured_at among contributing sources
+    double composite;                           // average of contributing source values
 };
 
+// Stage 2: several capture threads, one per source, must be brought to the
+// same point in time before their frames are combined. Where Stage 1 solved
+// "release this one frame after a delay," Stage 2 solves a different
+// problem: "wait for a *group* of independent threads to all be ready, then
+// run the combining step exactly once." That's what std::barrier is for -
+// a queue can't express "don't proceed until everyone else has arrived."
+//
+// Each source gets its own Stage 1 delay line as an input buffer (so late
+// jitter on one source doesn't corrupt another's timing), and one worker
+// thread per source pops from it and rendezvous at a shared std::barrier.
+// The barrier's completion function - invoked exactly once per phase, by
+// whichever thread happens to be the last to arrive - does the fusion.
+//
+// Because every worker's writes to latest_[source_id] happen-before it
+// calls arrive_and_wait(), and std::barrier guarantees those happen-before
+// the completion function runs, do_fuse() can read latest_ with no extra
+// locking: the barrier itself is the synchronization.
 class FusionStage {
 public:
     using FusedCallback = std::function<void(FusedFrame)>;
@@ -41,8 +61,10 @@ public:
         }
     }
 
+    // Capture-side: call from source i's own capture thread.
     void push(std::size_t source_id, Frame frame) { delay_lines_[source_id]->push(std::move(frame)); }
 
+    // Call once a source's capture thread has produced its last frame.
     void stop_source(std::size_t source_id) { delay_lines_[source_id]->stop(); }
 
     void start_workers() {
@@ -61,6 +83,10 @@ private:
         for (;;) {
             auto frame = delay_lines_[source_id]->pop();
             if (!frame) {
+                // No more data will ever arrive from this source. Dropping
+                // (rather than just returning) tells the barrier to expect
+                // one fewer arrival on every future phase, so the remaining
+                // sources are never left waiting on a thread that's gone.
                 active_[source_id] = false;
                 barrier_.arrive_and_drop();
                 return;
@@ -71,6 +97,11 @@ private:
     }
 
     void do_fuse() {
+        // arrive_and_drop() counts as an arrival, so the phase in which the
+        // last active source(s) drop out still completes this phase and
+        // runs do_fuse() once more - with nothing left active. That final
+        // call carries no real data, so it's discarded here rather than
+        // handed to on_fused_.
         bool any_active = false;
         for (std::size_t i = 0; i < num_sources_; ++i) any_active = any_active || active_[i];
         if (!any_active) return;

@@ -1,3 +1,19 @@
+// Stage 2: multi-source fusion with barriers.
+//
+// Simulates a broadcast keyer combining three independent camera-like
+// sources (camera / key / fill). Each source has its own capture thread and
+// its own Stage 1 delay line (include/delay_line_mutex.hpp) as an input
+// buffer. A FusionStage (include/fusion_stage.hpp) uses std::barrier to
+// bring one worker per source to the same rendezvous point before combining
+// their latest frames - the coordination need here ("wait for everyone,
+// then run one combining step") is different from Stage 1's "release this
+// one item after a delay," which is why a queue alone can't express it.
+//
+// std::latch also makes an appearance: a one-shot gate that holds all three
+// capture threads back until every one of them is ready, so they all start
+// producing frames at the same instant instead of drifting in one at a
+// time as std::thread happens to schedule them.
+
 #include "fusion_stage.hpp"
 
 #include <chrono>
@@ -20,6 +36,8 @@ constexpr int kFrameCount = 30;
 constexpr auto kFrameInterval = 33ms; // ~30 fps
 constexpr auto kPerSourceDelay = 150ms;
 
+// Each source produces a distinct, easy-to-verify signal so the printed
+// composite can be checked by eye: source i contributes (i * 100 + frame id).
 double source_value(std::size_t source_id, int frame_id) {
     return static_cast<double>(source_id) * 100.0 + static_cast<double>(frame_id);
 }
@@ -30,7 +48,7 @@ int main() {
     std::cout << "Stage 2: multi-source fusion with std::latch + std::barrier\n\n";
 
     std::vector<FusedFrame> fused_frames;
-    std::mutex fused_frames_mutex;
+    std::mutex fused_frames_mutex; // protects the vector's own bookkeeping, not the data races within a phase
 
     FusionStage fusion(kNumSources, kPerSourceDelay, [&](FusedFrame f) {
         std::lock_guard lock(fused_frames_mutex);
@@ -38,6 +56,8 @@ int main() {
     });
     fusion.start_workers();
 
+    // Holds all capture threads back until every one of them has finished
+    // setup, so they all begin their frame loop at the same instant.
     std::latch start_gate(kNumSources);
 
     std::vector<std::thread> producers;
