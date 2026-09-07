@@ -28,3 +28,4 @@ add_demo(example_packaged_task examples/packaged_task.cpp)
 
 # Composed project stages: each reuses components from include/.
 add_demo(stage1_delay_line stages/stage1_delay_line.cpp)
+add_demo(stage2_fusion stages/stage2_fusion.cpp)
