@@ -49,6 +49,22 @@ public:
         }
     }
 
+    // Non-blocking variant of pop(): returns std::nullopt immediately if the
+    // buffer is empty or the oldest frame's delay hasn't elapsed yet, instead
+    // of waiting. For a caller that must stay responsive to other work (see
+    // PipelineController in Stage 3) rather than dedicating a whole thread
+    // to this one queue.
+    std::optional<T> try_pop() {
+        std::lock_guard lock(mutex_);
+        if (buffer_.empty()) return std::nullopt;
+        if (std::chrono::steady_clock::now() < buffer_.front().ts + delay_) return std::nullopt;
+
+        T v = std::move(buffer_.front().value);
+        buffer_.pop_front();
+        cv_not_full_.notify_one();
+        return v;
+    }
+
     // Signals producer/consumer to unblock once no more items will be
     // pushed. pop() keeps draining whatever remains before returning nullopt.
     void stop() {
